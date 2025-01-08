@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 #include <fstream>
+#include <queue>
+#include <thread>
 
 namespace beast = boost::beast;
 namespace http = beast::http;
@@ -60,32 +62,51 @@ std::string to_base64(const std::vector<uint8_t>& data) {
 }
 
 std::vector<uint8_t> convert_stl_to_glb(const std::vector<uint8_t>& stl_data) {
+    // TODO: Assimp doesnt properly support gltf/glb exports. switch library.
+    if (stl_data.empty()) {
+        throw std::runtime_error("Empty STL data provided");
+    }
     Assimp::Importer importer;
-    Assimp::Exporter exporter;
-
-    std::cout << "Converting stl data..." << std::endl;
+    importer.SetPropertyInteger(AI_CONFIG_PP_RVC_FLAGS,
+        aiComponent_COLORS | aiComponent_TEXTURES | aiComponent_NORMALS);
 
     const aiScene* scene = importer.ReadFileFromMemory(
         stl_data.data(),
         stl_data.size(),
-        aiProcess_Triangulate | aiProcess_GenNormals
+        aiProcess_Triangulate |
+        aiProcess_GenNormals |
+        aiProcess_ValidateDataStructure |
+        aiProcess_OptimizeMeshes |
+        aiProcess_JoinIdenticalVertices,
+        "stl"
     );
 
-    if (!scene) {
+    if (!scene || !scene->mRootNode || scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE) {
         throw std::runtime_error("Failed to load STL file: " + std::string(importer.GetErrorString()));
     }
 
-    std::vector<uint8_t> glb_data;
-    const aiExportDataBlob *blob = exporter.ExportToBlob(scene, "glb");
-
-    if (!blob) {
-        throw std::runtime_error("Failed to export to GLB");
+    if (!scene->HasMeshes() || scene->mNumMeshes == 0) {
+        throw std::runtime_error("STL file contains no valid meshes");
     }
 
-    glb_data.resize(blob->size);
-    std::memcpy(glb_data.data(), blob->data, blob->size);
+    Assimp::Exporter exporter;
 
-    delete blob;
+    const aiExportDataBlob *blob = exporter.ExportToBlob(scene, "glb", aiProcess_PreTransformVertices);
+
+    if (!blob || !blob->data || blob->size == 0) {
+        throw std::runtime_error("Failed to export to GLB or exported data is empty");
+    }
+
+    std::vector<uint8_t> glb_data(static_cast<const uint8_t*>(blob->data),
+                                     static_cast<const uint8_t*>(blob->data) + blob->size);
+
+    // Validate GLB header (basic check)
+    if (glb_data.size() < 12 ||
+        glb_data[0] != 'g' || glb_data[1] != 'l' || glb_data[2] != 'T' || glb_data[3] != 'F') {
+        throw std::runtime_error("Generated GLB file has invalid header");
+    }
+
+    std::cout << "GLB size: " << glb_data.size() << std::endl;
 
     return glb_data;
 }
@@ -127,7 +148,7 @@ std::vector<uint8_t> optimize_stl(const std::vector<uint8_t>& stl_data) {
     return optimized_data;
 }
 
-http::response<http::string_body> handle_request(http::request<http::string_body> const& req) {
+http::message_generator handle_request(http::request<http::string_body> const& req) {
     http::response<http::string_body> res{http::status::ok, req.version()};
     res.set(http::field::server, "Beast");
     res.keep_alive(req.keep_alive());
@@ -146,21 +167,21 @@ http::response<http::string_body> handle_request(http::request<http::string_body
                 return res;
             }
 
-            std::vector<uint8_t> input_data(req.body().begin(), req.body().end());
+            const std::vector<uint8_t> input_data(req.body().begin(), req.body().end());
 
             if (req.target() == "/convert") {
-                auto glb_data = convert_stl_to_glb(input_data);
+                const auto glb_data = convert_stl_to_glb(input_data);
                 res.set(http::field::content_type, "model/gltf-binary");
                 res.body() = to_base64(glb_data);
             }
             else if (req.target() == "/optimize") {
-                auto optimized_data = optimize_stl(input_data);
+                const auto optimized_data = optimize_stl(input_data);
                 res.set(http::field::content_type, "model/stl");
                 res.body() = to_base64(optimized_data);
             }
             else if (req.target() == "/optimizeConvert") {
-                auto optimized_data = optimize_stl(input_data);
-                auto glb_data = convert_stl_to_glb(optimized_data);
+                const auto optimized_data = optimize_stl(input_data);
+                const auto glb_data = convert_stl_to_glb(optimized_data);
                 res.set(http::field::content_type, "model/gltf-binary");
                 res.body() = to_base64(glb_data);
             }
@@ -186,76 +207,113 @@ http::response<http::string_body> handle_request(http::request<http::string_body
     return res;
 }
 
+void fail(const beast::error_code &ec, char const* what) {
+    std::cerr << what << ": " << ec.message() << "\n";
+}
+
 class Session : public std::enable_shared_from_this<Session> {
-    tcp::socket socket_;
+    beast::tcp_stream stream_;
     beast::flat_buffer buffer_{8192};
-    http::request<http::string_body> req_;
+    boost::optional<http::request_parser<http::string_body>> parser_;
     http::response<http::string_body> res_;
 
+    static constexpr std::size_t queue_limit = 8; // max responses
+    std::queue<http::message_generator> response_queue_;
+
 public:
-    explicit Session(tcp::socket socket) : socket_(std::move(socket)) {}
+    explicit Session(tcp::socket&& socket): stream_(std::move(socket))
+    {
+        static_assert(queue_limit > 0, "queue limit must be positive");
+    }
 
     void run() {
-        do_read();
+        net::dispatch(
+            stream_.get_executor(),
+            beast::bind_front_handler(
+                &Session::do_read,
+                this->shared_from_this()));
     }
 
 private:
     void do_read() {
-        auto self(shared_from_this());
+        parser_.emplace();
 
-        req_ = {};
+        parser_->body_limit((std::numeric_limits<std::uint64_t>::max)());
 
-        http::response_parser<http::file_body> parser;
-        parser.body_limit((std::numeric_limits<std::uint64_t>::max)());
-        // TODO: Figure this out
+        stream_.expires_after(std::chrono::seconds(60));
 
         http::async_read(
-            socket_,
+            stream_,
             buffer_,
-            req_,
-            [self](beast::error_code ec, std::size_t bytes_transferred) {
-                if (ec == http::error::end_of_stream) {
-                    return self->do_close();
-                }
+            *parser_,
+            beast::bind_front_handler(
+                &Session::on_read,
+                shared_from_this()));
+    }
 
-                if (ec) {
-                    std::cerr << "Read error: " << ec.message() << std::endl;
-                    return;
-                }
+    void on_read(const beast::error_code &ec, std::size_t bytes_transferred) {
+        boost::ignore_unused(bytes_transferred);
 
-                std::cout << "Received request: " << self->req_.method_string() << " "
-                         << self->req_.target() << std::endl;
-                std::cout << "Content length: " << self->req_.body().length() << std::endl;
+        if(ec == http::error::end_of_stream)
+            return do_close();
 
-                self->res_ = handle_request(self->req_);
-                self->do_write();
-            });
+        if(ec)
+            return fail(ec, "read");
+
+        queue_write(handle_request(parser_->release()));
+
+        if (response_queue_.size() < queue_limit)
+            do_read();
+    }
+
+    void queue_write(http::message_generator response) {
+        response_queue_.push(std::move(response));
+
+        if (response_queue_.size() == 1)
+            do_write();
     }
 
     void do_write() {
-        auto self(shared_from_this());
+        if(!response_queue_.empty()){
+            bool keep_alive = response_queue_.front().keep_alive();
 
-        res_.prepare_payload();
+            beast::async_write(
+                stream_,
+                std::move(response_queue_.front()),
+                beast::bind_front_handler(
+                    &Session::on_write,
+                    shared_from_this(),
+                    keep_alive));
+        }
+    }
 
-        http::async_write(
-            socket_,
-            res_,
-            [self](beast::error_code ec, std::size_t bytes_transferred) {
-                if (ec) {
-                    std::cerr << "Write error: " << ec.message() << std::endl;
-                    return;
-                }
+    void
+    on_write(
+        const bool keep_alive,
+        const beast::error_code &ec,
+        std::size_t bytes_transferred)
+    {
+        boost::ignore_unused(bytes_transferred);
 
-                if (self->req_.need_eof()) {
-                    return self->do_close();
-                }
-                self->do_read();
-            });
+        if(ec)
+            return fail(ec, "write");
+
+        if(!keep_alive)
+        {
+            return do_close();
+        }
+
+        if(response_queue_.size() == queue_limit)
+            do_read();
+
+        response_queue_.pop();
+
+        do_write();
     }
 
     void do_close() {
         beast::error_code ec;
-        socket_.shutdown(tcp::socket::shutdown_send, ec);
+        stream_.socket().shutdown(tcp::socket::shutdown_send, ec);
     }
 };
 
@@ -264,58 +322,98 @@ class Listener : public std::enable_shared_from_this<Listener> {
     tcp::acceptor acceptor_;
 
 public:
-    Listener(net::io_context& ioc, const tcp::endpoint& endpoint)
-        : ioc_(ioc), acceptor_(net::make_strand(ioc)) {
+    Listener(net::io_context& ioc,
+        const tcp::endpoint& endpoint) : ioc_(ioc), acceptor_(net::make_strand(ioc))
+    {
         beast::error_code ec;
 
         acceptor_.open(endpoint.protocol(), ec);
-        if (ec) {
-            std::cerr << "Open error: " << ec.message() << std::endl;
+        if(ec)
+        {
+            fail(ec, "open");
             return;
         }
 
         acceptor_.set_option(net::socket_base::reuse_address(true), ec);
-        if (ec) {
-            std::cerr << "Set option error: " << ec.message() << std::endl;
+        if(ec)
+        {
+            fail(ec, "set_option");
             return;
         }
 
         acceptor_.bind(endpoint, ec);
-        if (ec) {
-            std::cerr << "Bind error: " << ec.message() << std::endl;
+        if(ec)
+        {
+            fail(ec, "bind");
             return;
         }
 
-        acceptor_.listen(net::socket_base::max_listen_connections, ec);
-        if (ec) {
-            std::cerr << "Listen error: " << ec.message() << std::endl;
+        acceptor_.listen(
+            net::socket_base::max_listen_connections, ec);
+        if(ec)
+        {
+            fail(ec, "listen");
             return;
+        }
+    }
+
+    void run()
+    {
+        net::dispatch(
+            acceptor_.get_executor(),
+            beast::bind_front_handler(
+                &Listener::do_accept,
+                this->shared_from_this()));
+    }
+
+
+private:
+    void do_accept() {
+        acceptor_.async_accept(
+            net::make_strand(ioc_),
+            beast::bind_front_handler(
+                &Listener::on_accept,
+                shared_from_this()));
+    }
+
+    void on_accept(const beast::error_code &ec, tcp::socket socket) {
+        if(ec)
+        {
+            fail(ec, "accept");
+        }
+        else
+        {
+            std::make_shared<Session>(std::move(socket))->run();
         }
 
         do_accept();
     }
 
-private:
-    void do_accept() {
-        acceptor_.async_accept(net::make_strand(ioc_), [this](const beast::error_code &ec, tcp::socket socket) {
-            if (!ec) {
-                std::make_shared<Session>(std::move(socket))->run();
-            }
-            do_accept();
-        });
-    }
 };
 
 int main() {
     try {
         auto const address = net::ip::make_address("0.0.0.0");
         constexpr unsigned short port = 8080;
+        constexpr auto threads = 1;
 
-        net::io_context ioc{1};
+        net::io_context ioc{threads};
 
-        auto listener = std::make_shared<Listener>(ioc, tcp::endpoint{address, port});
+        std::make_shared<Listener>(ioc, tcp::endpoint{address, port})->run();
+        std::cout << "listening on " << address << ":" << port << std::endl;
 
+        // std::vector<std::thread> v;
+        // v.reserve(threads - 1);
+        // for(auto i = threads - 1; i > 0; --i)
+        //     v.emplace_back(
+        //     [&ioc]
+        //     {
+        //         ioc.run();
+        //     });
         ioc.run();
+
+
+        return EXIT_SUCCESS;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
     }
