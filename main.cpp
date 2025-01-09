@@ -19,66 +19,12 @@ namespace http = beast::http;
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
-struct Vertex {
-    std::array<float, 3> position;
-    std::array<float, 3> color;
-};
-
-enum class Output {
-    Standard,
-    Binary,
-};
-
-std::string to_base64(const std::vector<uint8_t>& data) {
-    static constexpr char base64_chars[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    std::string result;
-    int i = 0;
-    uint8_t char_array_3[3];
-    uint8_t char_array_4[4];
-
-    for (const unsigned char c : data) {
-        char_array_3[i++] = c;
-        if (i == 3) {
-            char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
-            char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
-            char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
-            char_array_4[3] = char_array_3[2] & 0x3f;
-
-            for(i = 0; i < 4; i++)
-                result += base64_chars[char_array_4[i]];
-            i = 0;
-        }
-    }
-
-    if (i) {
-        int j = 0;
-        for(j = i; j < 3; j++)
-            char_array_3[j] = '\0';
-
-        char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
-        char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
-        char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
-
-        for (j = 0; j < i + 1; j++)
-            result += base64_chars[char_array_4[j]];
-
-        while(i++ < 3)
-            result += '=';
-    }
-
-    return result;
-}
-
 std::vector<uint8_t> convert_stl_to_glb(const std::vector<uint8_t>& stl_data) {
-    // TODO: Assimp doesnt properly support gltf/glb exports. switch library.
     if (stl_data.empty()) {
         throw std::runtime_error("Empty STL data provided");
     }
     Assimp::Importer importer;
-    importer.SetPropertyInteger(AI_CONFIG_PP_RVC_FLAGS,
-        aiComponent_COLORS | aiComponent_TEXTURES | aiComponent_NORMALS);
+
 
     const aiScene* scene = importer.ReadFileFromMemory(
         stl_data.data(),
@@ -101,7 +47,7 @@ std::vector<uint8_t> convert_stl_to_glb(const std::vector<uint8_t>& stl_data) {
 
     Assimp::Exporter exporter;
 
-    const aiExportDataBlob *blob = exporter.ExportToBlob(scene, "glb", aiProcess_PreTransformVertices);
+    const aiExportDataBlob *blob = exporter.ExportToBlob(scene, "glb2", aiProcess_PreTransformVertices);
 
     if (!blob || !blob->data || blob->size == 0) {
         throw std::runtime_error("Failed to export to GLB or exported data is empty");
@@ -110,13 +56,10 @@ std::vector<uint8_t> convert_stl_to_glb(const std::vector<uint8_t>& stl_data) {
     std::vector<uint8_t> glb_data(static_cast<const uint8_t*>(blob->data),
                                      static_cast<const uint8_t*>(blob->data) + blob->size);
 
-    // Validate GLB header (basic check)
     if (glb_data.size() < 12 ||
         glb_data[0] != 'g' || glb_data[1] != 'l' || glb_data[2] != 'T' || glb_data[3] != 'F') {
         throw std::runtime_error("Generated GLB file has invalid header");
     }
-
-    std::cout << "GLB size: " << glb_data.size() << std::endl;
 
     return glb_data;
 }
@@ -136,7 +79,8 @@ std::vector<uint8_t> optimize_stl(const std::vector<uint8_t>& stl_data) {
         aiProcess_FixInfacingNormals |
         aiProcess_RemoveRedundantMaterials |
         aiProcess_OptimizeMeshes |
-        aiProcess_OptimizeGraph
+        aiProcess_OptimizeGraph,
+        "stl"
     );
 
     if (!scene) {
@@ -163,10 +107,6 @@ http::message_generator handle_request(http::request<http::string_body> const& r
     res.set(http::field::server, "Beast");
     res.keep_alive(req.keep_alive());
 
-    std::cout << "Processing request for: " << req.target() << std::endl;
-    std::cout << "Method: " << req.method_string() << std::endl;
-    std::cout << "Content-Length: " << req.payload_size().value() << std::endl;
-
     try {
         if (req.method() == http::verb::post) {
             if (req.payload_size().get_value_or(0) == 0) {
@@ -182,18 +122,18 @@ http::message_generator handle_request(http::request<http::string_body> const& r
             if (req.target() == "/convert") {
                 const auto glb_data = convert_stl_to_glb(input_data);
                 res.set(http::field::content_type, "model/gltf-binary");
-                res.body() = to_base64(glb_data);
+                res.body() = std::string(glb_data.begin(), glb_data.end());
             }
             else if (req.target() == "/optimize") {
                 const auto optimized_data = optimize_stl(input_data);
                 res.set(http::field::content_type, "model/stl");
-                res.body() = to_base64(optimized_data);
+                res.body() = std::string(optimized_data.begin(), optimized_data.end());
             }
             else if (req.target() == "/optimizeConvert") {
                 const auto optimized_data = optimize_stl(input_data);
                 const auto glb_data = convert_stl_to_glb(optimized_data);
                 res.set(http::field::content_type, "model/gltf-binary");
-                res.body() = to_base64(glb_data);
+                res.body() = std::string(glb_data.begin(), glb_data.end());
             }
             else {
                 res.result(http::status::not_found);
@@ -285,7 +225,6 @@ private:
 
     void do_write() {
         if(!response_queue_.empty()){
-            bool keep_alive = response_queue_.front().keep_alive();
 
             beast::async_write(
                 stream_,
@@ -293,7 +232,7 @@ private:
                 beast::bind_front_handler(
                     &Session::on_write,
                     shared_from_this(),
-                    keep_alive));
+                    false));
         }
     }
 
