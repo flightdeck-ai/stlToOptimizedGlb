@@ -19,6 +19,16 @@ namespace http = beast::http;
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
+struct Vertex {
+    std::array<float, 3> position;
+    std::array<float, 3> color;
+};
+
+enum class Output {
+    Standard,
+    Binary,
+};
+
 std::string to_base64(const std::vector<uint8_t>& data) {
     static constexpr char base64_chars[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
