@@ -68,7 +68,7 @@ std::vector<uint8_t> optimize_stl(const std::vector<uint8_t>& stl_data) {
     Assimp::Importer importer;
     Assimp::Exporter exporter;
 
-    // TODO: Implement properly
+    // TODO: Implement properly (Maybe)
 
     const aiScene* scene = importer.ReadFileFromMemory(
         stl_data.data(),
@@ -96,8 +96,6 @@ std::vector<uint8_t> optimize_stl(const std::vector<uint8_t>& stl_data) {
 
     optimized_data.resize(blob->size);
     std::memcpy(optimized_data.data(), blob->data, blob->size);
-
-    delete blob;
 
     return optimized_data;
 }
@@ -351,6 +349,7 @@ int main() {
         std::make_shared<Listener>(ioc, tcp::endpoint{address, port})->run();
         std::cout << "listening on " << address << ":" << port << std::endl;
 
+        // UNCOMMENT THIS IF MT is used
         // std::vector<std::thread> v;
         // v.reserve(threads - 1);
         // for(auto i = threads - 1; i > 0; --i)
