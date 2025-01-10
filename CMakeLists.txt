@@ -2,7 +2,6 @@ cmake_minimum_required(VERSION 3.20)
 project(stlToOptimizedGlb)
 
 set(CMAKE_CXX_STANDARD 17)
-cmake_policy(SET CMP0167 NEW)
 
 find_package(Boost REQUIRED COMPONENTS system filesystem)
 find_package(assimp REQUIRED)
