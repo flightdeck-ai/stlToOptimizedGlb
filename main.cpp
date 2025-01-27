@@ -25,7 +25,7 @@ std::vector<uint8_t> convert_stl_to_glb(const std::vector<uint8_t>& stl_data) {
     }
     Assimp::Importer importer;
 
-
+    // Load STL
     const aiScene* scene = importer.ReadFileFromMemory(
         stl_data.data(),
         stl_data.size(),
@@ -45,20 +45,51 @@ std::vector<uint8_t> convert_stl_to_glb(const std::vector<uint8_t>& stl_data) {
         throw std::runtime_error("STL file contains no valid meshes");
     }
 
-    Assimp::Exporter exporter;
+    // Compute centroid
+    aiVector3D centroid(0.0f, 0.0f, 0.0f);
+    size_t vertexCount = 0;
+    for (unsigned int i = 0; i < scene->mNumMeshes; ++i) {
+        const aiMesh* mesh = scene->mMeshes[i];
+        for (unsigned int j = 0; j < mesh->mNumVertices; ++j) {
+            centroid += mesh->mVertices[j];
+            vertexCount++;
+        }
+    }
+    if (vertexCount == 0) throw std::runtime_error("No vertices found");
+    centroid /= static_cast<float>(vertexCount);
 
-    const aiExportDataBlob *blob = exporter.ExportToBlob(scene, "glb2", aiProcess_PreTransformVertices);
+    // Create a mutable copy of the scene
+    aiScene* modifiedScene = importer.GetOrphanedScene();
+    aiVector3D translation(-centroid.x, -centroid.y, -centroid.z);
 
-    if (!blob || !blob->data || blob->size == 0) {
-        throw std::runtime_error("Failed to export to GLB or exported data is empty");
+    // Translate all vertices to center at origin
+    for (unsigned int i = 0; i < modifiedScene->mNumMeshes; ++i) {
+        aiMesh* mesh = modifiedScene->mMeshes[i];
+        for (unsigned int j = 0; j < mesh->mNumVertices; ++j) {
+            mesh->mVertices[j] += translation;
+        }
     }
 
-    std::vector<uint8_t> glb_data(static_cast<const uint8_t*>(blob->data),
-                                     static_cast<const uint8_t*>(blob->data) + blob->size);
+    // Export to GLB
+    Assimp::Exporter exporter;
+    const aiExportDataBlob* blob = exporter.ExportToBlob(
+        modifiedScene,
+        "glb2",
+        aiProcess_PreTransformVertices
+    );
 
-    if (glb_data.size() < 12 ||
-        glb_data[0] != 'g' || glb_data[1] != 'l' || glb_data[2] != 'T' || glb_data[3] != 'F') {
-        throw std::runtime_error("Generated GLB file has invalid header");
+    if (!blob || !blob->data || blob->size == 0) {
+        throw std::runtime_error("Failed to export GLB");
+    }
+
+    std::vector<uint8_t> glb_data(
+        static_cast<const uint8_t*>(blob->data),
+        static_cast<const uint8_t*>(blob->data) + blob->size
+    );
+
+    // Validate GLB header
+    if (glb_data.size() < 12 || !std::equal(glb_data.begin(), glb_data.begin()+4, "glTF")) {
+        throw std::runtime_error("Invalid GLB header");
     }
 
     return glb_data;
