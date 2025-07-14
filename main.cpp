@@ -170,9 +170,15 @@ http::message_generator handle_request(http::request<http::string_body> const& r
                 res.body() = "Route not found";
             }
         } else {
-            res.result(http::status::method_not_allowed);
-            res.set(http::field::content_type, "text/plain");
-            res.body() = "Method not allowed";
+            if (req.method() == http::verb::get && req.target() == "/health") {
+                res.result(http::status::ok);
+                res.set(http::field::content_type, "text/plain");
+                res.body() = "OK";
+            } else {
+                res.result(http::status::method_not_allowed);
+                res.set(http::field::content_type, "text/plain");
+                res.body() = "Method not allowed";
+            }
         }
     }
     catch (const std::exception& e) {
