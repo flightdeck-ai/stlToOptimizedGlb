@@ -151,17 +151,20 @@ http::message_generator handle_request(http::request<http::string_body> const& r
             if (req.target() == "/convert") {
                 const auto glb_data = convert_stl_to_glb(input_data);
                 res.set(http::field::content_type, "model/gltf-binary");
+                res.set(http::field::transfer_encoding, "chunked");
                 res.body() = std::string(glb_data.begin(), glb_data.end());
             }
             else if (req.target() == "/optimize") {
                 const auto optimized_data = optimize_stl(input_data);
                 res.set(http::field::content_type, "model/stl");
+                res.set(http::field::transfer_encoding, "chunked");
                 res.body() = std::string(optimized_data.begin(), optimized_data.end());
             }
             else if (req.target() == "/optimizeConvert") {
                 const auto optimized_data = optimize_stl(input_data);
                 const auto glb_data = convert_stl_to_glb(optimized_data);
                 res.set(http::field::content_type, "model/gltf-binary");
+                res.set(http::field::transfer_encoding, "chunked");
                 res.body() = std::string(glb_data.begin(), glb_data.end());
             }
             else {
